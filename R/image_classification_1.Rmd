@@ -66,6 +66,14 @@ valid_data_gen <- image_data_generator(
 
 ```
 
+```{r}
+#Import data
+temp <- tempfile()
+download.file("https://www.kaggle.com/moltean/fruits/downloads/fruits.zip/44",temp)
+
+
+```
+
 
 ```{r}
 #Load images
