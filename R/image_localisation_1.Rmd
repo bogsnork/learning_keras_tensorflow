@@ -6,14 +6,16 @@ output: html_notebook
 courtesy of https://blogs.rstudio.com/tensorflow/posts/2018-11-05-naming-locating-objects/ 
 
 Get data via terminal: 
-# cd data/input_data
-# curl -OL http://pjreddie.com/media/files/VOCtrainval_06-Nov-2007.tar
-# curl -OL https://storage.googleapis.com/coco-dataset/external/PASCAL_VOC.zip
-# tar -xf VOCtrainval_06-Nov-2007.tar
-# unzip PASCAL_VOC.zip
-# mv PASCAL_VOC/*.json .
-# rmdir PASCAL_VOC
-# tar -xvf VOCtrainval_06-Nov-2007.tar
+```{bash}
+cd data/input_data
+curl -OL http://pjreddie.com/media/files/VOCtrainval_06-Nov-2007.tar
+curl -OL https://storage.googleapis.com/coco-dataset/external/PASCAL_VOC.zip
+tar -xf VOCtrainval_06-Nov-2007.tar
+unzip PASCAL_VOC.zip
+mv PASCAL_VOC/*.json .
+rmdir PASCAL_VOC
+tar -xvf VOCtrainval_06-Nov-2007.tar
+```
 
 
 ```{r}
@@ -446,5 +448,231 @@ model %>% fit_generator(
 
 ## Single-object localization
 
+From here on, we’re back to dealing with a single object per image. So the question now is, how do we learn bounding boxes? If you’ve never heard of this, the answer will sound unbelievably simple (naive even): We formulate this as a regression problem and aim to predict the actual coordinates. To set realistic expectations - we surely shouldn’t expect ultimate precision here. But in a way it’s amazing it does even work at all.
 
+What does this mean, formulate as a regression problem? Concretely, it means we’ll have a dense output layer with 4 units, each corresponding to a corner coordinate.
+
+So let’s start with the model this time. Again, we use Xception, but there’s an important difference here: Whereas before, we said pooling = "avg" to obtain an output tensor of dimensions batch_size * number of filters, here we don’t do any averaging or flattening out of the spatial grid. This is because it’s exactly the spatial information we’re interested in!
+
+For Xception, the output resolution will be 7x7. So a priori, we shouldn’t expect high precision on objects much smaller than about 32x32 pixels (assuming the standard input size of 224x224).
+
+```{r}
+feature_extractor <- application_xception(
+  include_top = FALSE,
+  input_shape = c(224, 224, 3)
+)
+
+feature_extractor %>% freeze_weights()
+
+#Now we append our custom regression module.
+
+model <- keras_model_sequential() %>%
+  feature_extractor %>%
+  layer_flatten() %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 0.25) %>%
+  layer_dense(units = 512, activation = "relu") %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 4)
+```
+
+
+
+We will train with one of the loss functions common in regression tasks, mean absolute error. But in tasks like object detection or segmentation, we’re also interested in a more tangible quantity: How much do estimate and ground truth overlap?
+
+Overlap is usually measured as Intersection over Union, or Jaccard distance. Intersection over Union is exactly what it says, a ratio between space shared by the objects and space occupied when we take them together.
+
+To assess the model’s progress, we can easily code this as a custom metric:
+
+
+```{r}
+metric_iou <- function(y_true, y_pred) {
+  
+  # order is [x_left, y_top, x_right, y_bottom]
+  intersection_xmin <- k_maximum(y_true[ ,1], y_pred[ ,1])
+  intersection_ymin <- k_maximum(y_true[ ,2], y_pred[ ,2])
+  intersection_xmax <- k_minimum(y_true[ ,3], y_pred[ ,3])
+  intersection_ymax <- k_minimum(y_true[ ,4], y_pred[ ,4])
+  
+  area_intersection <- (intersection_xmax - intersection_xmin) * 
+                       (intersection_ymax - intersection_ymin)
+  area_y <- (y_true[ ,3] - y_true[ ,1]) * (y_true[ ,4] - y_true[ ,2])
+  area_yhat <- (y_pred[ ,3] - y_pred[ ,1]) * (y_pred[ ,4] - y_pred[ ,2])
+  area_union <- area_y + area_yhat - area_intersection
+  
+  iou <- area_intersection/area_union
+  k_mean(iou)
+  
+}
+```
+
+
+```{r}
+#Model compilation then goes like
+
+model %>% compile(
+  optimizer = "adam",
+  loss = "mae",
+  metrics = list(custom_metric("iou", metric_iou))
+)
+```
+
+Now modify the generator to return bounding box coordinates as targets…
+
+
+```{r}
+localization_generator <-
+  function(data,
+           target_height,
+           target_width,
+           shuffle,
+           batch_size) {
+    i <- 1
+    function() {
+      if (shuffle) {
+        indices <- sample(1:nrow(data), size = batch_size)
+      } else {
+        if (i + batch_size >= nrow(data))
+          i <<- 1
+        indices <- c(i:min(i + batch_size - 1, nrow(data)))
+        i <<- i + length(indices)
+      }
+      x <-
+        array(0, dim = c(length(indices), target_height, target_width, 3))
+      y <- array(0, dim = c(length(indices), 4))
+      
+      for (j in 1:length(indices)) {
+        x[j, , , ] <-
+          load_and_preprocess_image(data[[indices[j], "file_name"]], 
+                                    target_height, target_width)
+        y[j, ] <-
+          data[indices[j], c("x_left_scaled",
+                             "y_top_scaled",
+                             "x_right_scaled",
+                             "y_bottom_scaled")] %>% as.matrix()
+      }
+      x <- x / 255
+      list(x, y)
+    }
+  }
+
+train_gen <- localization_generator(
+  train_data,
+  target_height = target_height,
+  target_width = target_width,
+  shuffle = TRUE,
+  batch_size = batch_size
+)
+
+valid_gen <- localization_generator(
+  validation_data,
+  target_height = target_height,
+  target_width = target_width,
+  shuffle = FALSE,
+  batch_size = batch_size
+)
+```
+
+… and we’re ready to go!
+
+
+```{r}
+model %>% fit_generator(
+  train_gen,
+  epochs = 20,
+  steps_per_epoch = nrow(train_data) / batch_size,
+  validation_data = valid_gen,
+  validation_steps = nrow(validation_data) / batch_size,
+  callbacks = list(
+    callback_model_checkpoint(
+      file.path("loc_only", "weights.{epoch:02d}-{val_loss:.2f}.hdf5")
+    ),
+    callback_early_stopping(patience = 2)
+  )
+)
+```
+
+
+After 8 epochs, IOU on both training and test sets is around 0.35. This number doesn’t look too good. To learn more about how training went, we need to see some predictions. Here’s a convenience function that displays an image, the ground truth box of the most salient object (as defined above), and if given, class and bounding box predictions.
+
+
+```{r}
+plot_image_with_boxes <- function(file_name,
+                                  object_class,
+                                  box,
+                                  scaled = FALSE,
+                                  class_pred = NULL,
+                                  box_pred = NULL) {
+  img <- image_read(file.path(img_dir, file_name))
+  if(scaled) img <- image_resize(img, geometry = "224x224!")
+  img <- image_draw(img)
+  x_left <- box[1]
+  y_bottom <- box[2]
+  x_right <- box[3]
+  y_top <- box[4]
+  rect(
+    x_left,
+    y_bottom,
+    x_right,
+    y_top,
+    border = "cyan",
+    lwd = 2.5
+  )
+  text(
+    x_left,
+    y_top,
+    object_class,
+    offset = 1,
+    pos = 2,
+    cex = 1.5,
+    col = "cyan"
+  )
+  if (!is.null(box_pred))
+    rect(box_pred[1],
+         box_pred[2],
+         box_pred[3],
+         box_pred[4],
+         border = "yellow",
+         lwd = 2.5)
+  if (!is.null(class_pred))
+    text(
+      box_pred[1],
+      box_pred[2],
+      class_pred,
+      offset = 0,
+      pos = 4,
+      cex = 1.5,
+      col = "yellow")
+  dev.off()
+  img %>% image_write(paste0("preds_", file_name))
+  plot(img)
+}
+```
+
+
+First, let’s see predictions on sample images from the training set.
+
+
+
+train_1_8 <- train_data[1:8, c("file_name",
+                               "name",
+                               "x_left_scaled",
+                               "y_top_scaled",
+                               "x_right_scaled",
+                               "y_bottom_scaled")]
+
+for (i in 1:8) {
+  preds <-
+    model %>% predict(
+      load_and_preprocess_image(train_1_8[i, "file_name"], 
+                                target_height, target_width),
+      batch_size = 1
+  )
+  plot_image_with_boxes(train_1_8$file_name[i],
+                        train_1_8$name[i],
+                        train_1_8[i, 3:6] %>% as.matrix(),
+                        scaled = TRUE,
+                        box_pred = preds)
+}
 
