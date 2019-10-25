@@ -36,7 +36,7 @@ library(stringr)
 ```{r}
 #define image directories 
 img_dir <- "../data/input_data/VOCdevkit/VOC2007/JPEGImages"
-annot_file <- "../data/input_data/pascal_train2007.json"
+annot_file <- "../data/input_data/PASCAL_VOC/pascal_train2007.json"
 ```
 
 ```{r}
@@ -106,7 +106,7 @@ boxinfo <- boxinfo %>% mutate_all(as.numeric)
 
 boxinfo <- boxinfo %>% 
   mutate(y_bottom = y_top + bbox_height - 1, x_right = x_left + bbox_width - 1)
-
+boxinfo
 ```
 
 
